@@ -40,12 +40,13 @@ def active(c, plate):
 
 
 def normalize(text):
-    return re.sub(r"\s+", "", text).upper()
+    return re.sub(r"\s+", "", str(text)).upper()
 
 
 def plates_from_text(text):
-    # 국내 일반 자동차 번호판 예시: 12가3456 / 123가4567
-    return re.findall(r"(?<!\d)\d{2,3}[가-힣]\d{4}(?!\d)", normalize(text))
+    # OCR이 글자를 띄어 읽는 경우도 허용한다.
+    cleaned = re.sub(r"[^0-9가-힣]", "", normalize(text))
+    return re.findall(r"(?<!\d)\d{2,3}[가-힣]\d{4}(?!\d)", cleaned)
 
 
 def enter(plate):
@@ -78,22 +79,39 @@ def reader():
 
 
 def recognize(image):
-    # 서버에서 프레임을 OCR 처리. YOLO 번호판 검출은 아직 없음.
     import cv2
     rgb = np.asarray(image.convert('RGB'))
-    variants = [rgb]
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    variants.append(cv2.cvtColor(cv2.equalizeHist(gray), cv2.COLOR_GRAY2RGB))
-    matches = []
-    for variant in variants:
-        results = reader().readtext(variant, detail=0, paragraph=False)
-        texts = [normalize(str(t)) for t in results]
-        matches.extend(plates_from_text(''.join(texts)))
-        for t in texts:
-            matches.extend(plates_from_text(t))
-        if matches:
-            break
-    return matches[0] if matches else None
+    h, w = rgb.shape[:2]
+    # 화면 중앙의 번호판을 크게 비추면 주변 글자 간섭이 줄어든다.
+    crops = [("전체", rgb)]
+    if w >= 240 and h >= 160:
+        crops.insert(0, ("중앙", rgb[int(h*.23):int(h*.77), int(w*.08):int(w*.92)]))
+
+    seen = []
+    raw_texts = []
+    for region, crop in crops:
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        # 작은 번호판을 키우고 대비를 보정해 OCR에 전달
+        variants = [
+            ("원본", crop),
+            ("대비보정", cv2.cvtColor(cv2.resize(enhanced, None, fx=2, fy=2), cv2.COLOR_GRAY2RGB)),
+        ]
+        for label, variant in variants:
+            results = reader().readtext(variant, detail=1, paragraph=False)
+            texts = [str(item[1]) for item in results]
+            raw_texts.extend([f"{region}/{label}: {t}" for t in texts])
+            # 전체 문장과 분리된 OCR 조각을 모두 검사
+            candidates = plates_from_text(''.join(texts))
+            for t in texts:
+                candidates.extend(plates_from_text(t))
+            for plate in candidates:
+                if plate not in seen:
+                    seen.append(plate)
+            if seen:
+                return seen[0], raw_texts[:15]
+    return None, raw_texts[:15]
 
 
 init()
@@ -112,7 +130,7 @@ for col, (label, val) in zip(st.columns(4), [('전체 주차면',9),('빈자리'
 camera_tab, parking_tab, lookup_tab, history_tab = st.tabs(['📱 실시간 휴대폰 카메라','🅿️ 주차면','🔎 내 차 찾기','📋 기록'])
 with camera_tab:
     mode = st.radio('카메라 위치', ['입구 (자동 입차)', '출구 (자동 출차)'], horizontal=True)
-    st.caption('휴대폰에서 카메라 시작을 누르세요. 영상은 휴대폰에 표시되고 약 2초마다 사진 프레임이 서버로 전달됩니다.')
+    st.caption('번호판을 화면 중앙에 크게, 가로 방향으로 비춰주세요. 약 2초마다 프레임을 분석합니다.')
     frame = camera(key='live_camera', default=None)
     if frame and isinstance(frame,dict) and 'frame' in frame:
         seq = frame.get('seq')
@@ -122,20 +140,32 @@ with camera_tab:
             try:
                 raw = base64.b64decode(frame['frame'].split(',',1)[1])
                 img = Image.open(io.BytesIO(raw))
-                plate = recognize(img)
+                plate, debug_texts = recognize(img)
+                st.session_state.ocr_debug = debug_texts
                 if plate:
                     st.session_state.last_detected = plate
-                    # 연속된 동일 번호판은 15초 동안 재처리하지 않음
-                    token = (mode,plate)
-                    last = st.session_state.get('last_event')
-                    if not last or last[0] != token or time.monotonic()-last[1] > 15:
-                        st.session_state.last_notice = enter(plate) if mode.startswith('입구') else leave(plate)
-                        st.session_state.last_event = (token,time.monotonic())
+                    # 서로 다른 프레임에서 같은 번호판을 2회 읽은 뒤 처리
+                    prev = st.session_state.get('candidate_plate')
+                    count = st.session_state.get('candidate_count', 0) + 1 if prev == plate else 1
+                    st.session_state.candidate_plate = plate
+                    st.session_state.candidate_count = count
+                    if count >= 2:
+                        token = (mode, plate)
+                        last = st.session_state.get('last_event')
+                        if not last or last[0] != token or time.monotonic() - last[1] > 30:
+                            st.session_state.last_notice = enter(plate) if mode.startswith('입구') else leave(plate)
+                            st.session_state.last_event = (token, time.monotonic())
                 else:
-                    st.session_state.last_detected = '인식 대기 중 (번호판을 크게 비춰주세요)'
+                    st.session_state.last_detected = '번호판 형식 미검출 (아래 OCR 원본 결과 확인)'
+                    st.session_state.candidate_plate = None
+                    st.session_state.candidate_count = 0
             except Exception as e:
                 st.session_state.last_detected = f'프레임 분석 오류: {e}'
     st.write('최근 인식:', st.session_state.get('last_detected','아직 없음'))
+    with st.expander('🔎 OCR 진단 결과 (인식 안 될 때 확인)', expanded=True):
+        raw = st.session_state.get('ocr_debug', [])
+        st.write(' / '.join(raw) if raw else 'OCR이 읽은 글자가 아직 없습니다. 카메라 시작 후 기다려주세요.')
+        st.caption('여기에 글자가 나오면 카메라 프레임은 서버에 전달되고 있는 것입니다. 실제 번호판이 아닌 테스트용 모형을 사용하세요.')
     st.divider()
     st.write('**카메라 인식이 어려울 때 수동 테스트**')
     with st.form('manual'):
