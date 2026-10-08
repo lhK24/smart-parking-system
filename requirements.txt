@@ -1,5 +1,4 @@
+
 streamlit>=1.35,<2
-numpy>=1.24,<3
-Pillow>=10,<12
-opencv-python-headless>=4.8
-easyocr>=1.7.1
+requests>=2.31
+streamlit-autorefresh>=1.0.1
