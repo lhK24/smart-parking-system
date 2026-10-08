@@ -9,14 +9,15 @@ st.set_page_config(page_title='스마트 주차장', page_icon='🚗', layout='w
 st.title('🚗 스마트 주차장 · 실시간 현황')
 st.caption('핸드폰 카메라 → Google Colab OCR → Supabase → Streamlit · 5초마다 갱신')
 
-st.subheader('📷 실시간 번호판 카메라')
+st.subheader('📷 실시간 번호판 카메라 (이 사이트 안에서 보기)')
 cam_url = st.secrets.get('GRADIO_URL', '').strip().rstrip('/')
 parsed = urlparse(cam_url)
 if parsed.scheme == 'https' and parsed.netloc.endswith('.gradio.live'):
     st.link_button('카메라 전체 화면으로 열기 (핸드폰 추천)', cam_url)
-    components.iframe(cam_url, height=720, scrolling=True)
+    components.iframe(cam_url, height=650, scrolling=True)
+    st.caption('휴대폰 브라우저에서 카메라 접근이 차단되면 위 전체 화면 링크로 열어주세요.')
 else:
-    st.info('Colab 노트북의 마지막 셀을 실행하고, 생성된 https://....gradio.live 주소를 Streamlit Secrets의 GRADIO_URL에 추가하세요.')
+    st.warning('카메라 연결 대기 중: Colab에서 Gradio 카메라를 실행한 후 Streamlit Secrets에 GRADIO_URL을 저장해야 이 자리에 카메라가 표시됩니다.')
     st.caption('카메라를 켜려면 Colab이 실행 중이어야 합니다. 모바일에서 임베드가 안 되면 위 전체 화면 링크를 사용하세요.')
 st_autorefresh(interval=5000, key='refresh')
 try:
@@ -83,3 +84,4 @@ with t3:
         st.dataframe(visits,use_container_width=True,hide_index=True)
     except Exception as e: st.error(str(e))
 st.caption('데모 전용: 실제 차량번호·개인정보를 입력하지 마세요. 실제 결제는 수행하지 않습니다.')
+
