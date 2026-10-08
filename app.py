@@ -1,295 +1,85 @@
-
 import streamlit as st
 import requests
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import streamlit.components.v1 as components
+from urllib.parse import urlparse
+from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(
-    page_title="스마트 주차장",
-    page_icon="🚗",
-    layout="wide"
-)
+st.set_page_config(page_title='스마트 주차장', page_icon='🚗', layout='wide')
+st.title('🚗 스마트 주차장 · 실시간 현황')
+st.caption('핸드폰 카메라 → Google Colab OCR → Supabase → Streamlit · 5초마다 갱신')
 
-st.title("🚗 스마트 주차장 관리 시스템")
-st.caption("Google Colab 번호판 인식 · Supabase 연동")
-st_autorefresh(interval=5000, key="parking_refresh")
-
-# Supabase 연결
+st.subheader('📷 실시간 번호판 카메라')
+cam_url = st.secrets.get('GRADIO_URL', '').strip().rstrip('/')
+parsed = urlparse(cam_url)
+if parsed.scheme == 'https' and parsed.netloc.endswith('.gradio.live'):
+    st.link_button('카메라 전체 화면으로 열기 (핸드폰 추천)', cam_url)
+    components.iframe(cam_url, height=720, scrolling=True)
+else:
+    st.info('Colab 노트북의 마지막 셀을 실행하고, 생성된 https://....gradio.live 주소를 Streamlit Secrets의 GRADIO_URL에 추가하세요.')
+    st.caption('카메라를 켜려면 Colab이 실행 중이어야 합니다. 모바일에서 임베드가 안 되면 위 전체 화면 링크를 사용하세요.')
+st_autorefresh(interval=5000, key='refresh')
 try:
-    URL = st.secrets["SUPABASE_URL"].rstrip("/")
-    KEY = st.secrets["SUPABASE_ANON_KEY"]
+    URL = st.secrets['SUPABASE_URL'].rstrip('/')
+    KEY = st.secrets['SUPABASE_ANON_KEY']
 except Exception:
-    st.error(
-        "Streamlit Cloud의 Secrets에 "
-        "SUPABASE_URL과 SUPABASE_ANON_KEY를 등록해야 합니다."
-    )
+    st.error('Streamlit Cloud Secrets에 SUPABASE_URL과 SUPABASE_ANON_KEY를 등록하세요.')
     st.stop()
-
-HEADERS = {
-    "apikey": KEY,
-    "Authorization": f"Bearer {KEY}",
-    "Content-Type": "application/json",
-}
-
-def get_rows(table, params=None):
-    response = requests.get(
-        f"{URL}/rest/v1/{table}",
-        headers=HEADERS,
-        params=params,
-        timeout=15
-    )
-    response.raise_for_status()
-    return response.json()
-
-def patch_rows(table, params, values):
-    response = requests.patch(
-        f"{URL}/rest/v1/{table}",
-        headers={
-            **HEADERS,
-            "Prefer": "return=representation"
-        },
-        params=params,
-        json=values,
-        timeout=15
-    )
-    response.raise_for_status()
-    return response.json()
-
-def korean_time(value):
-    if not value:
-        return "-"
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.astimezone(
-            ZoneInfo("Asia/Seoul")
-        ).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return value
-
-# 데이터 조회
+HEADERS={'apikey':KEY,'Authorization':f'Bearer {KEY}'}
+if any(ord(c)>127 for c in KEY) or not KEY.startswith(('eyJ','sb_publishable_')):
+    st.error('SUPABASE_ANON_KEY에 실제 Supabase anon/public 키를 입력하세요. 예시 한글 문구를 넣으면 안 됩니다.')
+    st.stop()
+def fetch(table, params):
+    r=requests.get(f'{URL}/rest/v1/{table}',headers=HEADERS,params=params,timeout=12)
+    r.raise_for_status()
+    return r.json()
+def update(table, match, data):
+    r=requests.patch(f'{URL}/rest/v1/{table}',headers={**HEADERS,'Content-Type':'application/json','Prefer':'return=representation'},params=match,json=data,timeout=12)
+    r.raise_for_status()
+    return r.json()
 try:
-    spaces = get_rows(
-        "parking_spaces",
-        {
-            "select": "name,plate",
-            "order": "name.asc"
-        }
-    )
-
-    active = get_rows(
-        "parking_visits",
-        {
-            "select": "id,plate,entered_at,space",
-            "exited_at": "is.null",
-            "order": "entered_at.asc"
-        }
-    )
-
+    spaces=fetch('parking_spaces',{'select':'name,plate','order':'name.asc'})
+    active=fetch('parking_visits',{'select':'id,plate,entered_at,space','exited_at':'is.null','order':'entered_at.asc'})
 except Exception as e:
-    st.error(f"Supabase 연결 오류: {e}")
-    st.info("Supabase SQL 테이블과 Streamlit Secrets를 확인하세요.")
+    st.error(f'DB 연결 실패: {e}')
     st.stop()
-
-# 주차장 현황
-occupied = sum(1 for s in spaces if s["plate"])
-total = len(spaces)
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("전체 주차면", total)
-c2.metric("빈 주차면", total - occupied)
-c3.metric("사용 중", occupied)
-c4.metric("입차 차량", len(active))
-
-st.divider()
-
-st.subheader("🅿️ 실시간 주차 공간")
-
-for i in range(0, len(spaces), 3):
-    cols = st.columns(3)
-
-    for col, space in zip(cols, spaces[i:i + 3]):
+occupied=sum(bool(s['plate']) for s in spaces)
+a,b,c,d=st.columns(4)
+a.metric('전체 주차면',len(spaces)); b.metric('빈자리',len(spaces)-occupied)
+c.metric('사용 중',occupied); d.metric('입차 차량',len(active))
+st.subheader('주차 공간 현황')
+for i in range(0,len(spaces),3):
+    cols=st.columns(3)
+    for col,s in zip(cols,spaces[i:i+3]):
         with col:
-            if space["plate"]:
-                st.error(
-                    f"🚘 {space['name']}\n\n"
-                    f"차량번호: {space['plate']}"
-                )
-            else:
-                st.success(
-                    f"🅿️ {space['name']}\n\n빈자리"
-                )
-
-st.divider()
-
-tab1, tab2, tab3 = st.tabs([
-    "🔎 내 차 찾기",
-    "🚘 주차면 배정",
-    "📋 입출차 기록"
-])
-
-# 내 차 찾기
-with tab1:
-    st.subheader("차량 위치 조회")
-
-    search_plate = st.text_input(
-        "차량번호를 입력하세요",
-        placeholder="123가4568"
-    )
-
-    if st.button("차량 찾기"):
-        target = search_plate.strip().replace(" ", "")
-
-        matches = [
-            v for v in active
-            if v["plate"] == target
-        ]
-
-        if matches:
-            car = matches[0]
-
-            st.success(f"차량번호: {car['plate']}")
-            st.info(
-                f"주차 위치: {car['space'] or '아직 미배정'}"
-            )
-            st.write(
-                "입차 시간:",
-                korean_time(car["entered_at"])
-            )
-        else:
-            st.warning("현재 주차 중인 차량이 없습니다.")
-
-# 주차면 배정
-with tab2:
-    st.subheader("주차면 배정")
-    st.caption(
-        "초음파 센서 연결 전까지 사용하는 시뮬레이션 기능입니다."
-    )
-
-    waiting = [
-        v for v in active
-        if not v["space"]
-    ]
-
-    free_spaces = [
-        s["name"] for s in spaces
-        if not s["plate"]
-    ]
-
-    if waiting and free_spaces:
-        with st.form("assign_form"):
-            selected_car = st.selectbox(
-                "입차 차량",
-                waiting,
-                format_func=lambda x: x["plate"]
-            )
-
-            selected_space = st.selectbox(
-                "빈 주차면",
-                free_spaces
-            )
-
-            submitted = st.form_submit_button(
-                "주차면 배정"
-            )
-
-        if submitted:
+            if s['plate']: st.error(f"🚘 {s['name']} · {s['plate']}")
+            else: st.success(f"🅿️ {s['name']} · 빈자리")
+t1,t2,t3=st.tabs(['내 차 찾기','주차면 배정(센서 시뮬레이션)','입출차 기록'])
+with t1:
+    q=st.text_input('차량번호 입력')
+    if st.button('조회'):
+        match=[v for v in active if v['plate']==q.strip().replace(' ','')]
+        if match: st.success(f"주차 위치: {match[0]['space'] or '미배정'} / 입차: {match[0]['entered_at']}")
+        else: st.warning('입차 중인 차량이 없습니다.')
+with t2:
+    waiting=[v for v in active if not v['space']]
+    free=[s['name'] for s in spaces if not s['plate']]
+    if waiting and free:
+        with st.form('assign'):
+            v=st.selectbox('차량',waiting,format_func=lambda x:x['plate'])
+            space=st.selectbox('주차면',free)
+            submit=st.form_submit_button('배정')
+        if submit:
             try:
-                updated_space = patch_rows(
-                    "parking_spaces",
-                    {
-                        "name": f"eq.{selected_space}",
-                        "plate": "is.null"
-                    },
-                    {
-                        "plate": selected_car["plate"]
-                    }
-                )
-
-                if not updated_space:
-                    st.warning(
-                        "이미 사용 중인 주차면입니다. 새로고침하세요."
-                    )
-                else:
-                    updated_visit = patch_rows(
-                        "parking_visits",
-                        {
-                            "id": f"eq.{selected_car['id']}",
-                            "space": "is.null",
-                            "exited_at": "is.null"
-                        },
-                        {
-                            "space": selected_space
-                        }
-                    )
-
-                    if not updated_visit:
-                        # 두 번째 저장 실패 시 주차면 복구 시도
-                        patch_rows(
-                            "parking_spaces",
-                            {
-                                "name": f"eq.{selected_space}",
-                                "plate": f"eq.{selected_car['plate']}"
-                            },
-                            {"plate": None}
-                        )
-                        st.error("배정 실패. 다시 시도하세요.")
-                    else:
-                        st.success("주차면 배정 완료!")
-                        st.rerun()
-
-            except Exception as e:
-                st.error(f"배정 오류: {e}")
-    else:
-        st.info(
-            "배정 대기 차량이 없거나 빈 주차면이 없습니다."
-        )
-
-# 입출차 기록
-with tab3:
-    st.subheader("자동 입출차 기록")
-
+                # Demo only: two REST writes are not atomic; avoid simultaneous assignments.
+                update('parking_spaces',{'name':f'eq.{space}','plate':'is.null'},{'plate':v['plate']})
+                update('parking_visits',{'id':f"eq.{v['id']}",'space':'is.null'},{'space':space})
+                st.success('배정 완료'); st.rerun()
+            except Exception as e: st.error(str(e))
+    else: st.info('대기 차량 또는 빈 주차면이 없습니다.')
+with t3:
     try:
-        visits = get_rows(
-            "parking_visits",
-            {
-                "select": "plate,entered_at,exited_at,space,fee",
-                "order": "id.desc",
-                "limit": "100"
-            }
-        )
-
-        history = []
-
-        for v in visits:
-            history.append({
-                "차량번호": v["plate"],
-                "입차 시간": korean_time(v["entered_at"]),
-                "출차 시간": korean_time(v["exited_at"]),
-                "주차 위치": v["space"] or "-",
-                "주차요금(원)": (
-                    v["fee"] if v["fee"] is not None else "-"
-                ),
-                "상태": (
-                    "출차 완료"
-                    if v["exited_at"]
-                    else "주차 중"
-                )
-            })
-
-        st.dataframe(
-            history,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    except Exception as e:
-        st.error(f"기록 조회 오류: {e}")
-
-st.divider()
-st.caption(
-    "캡스톤 시연용 시스템 · 5초마다 자동 갱신 · "
-    "실제 결제는 수행하지 않습니다."
-)
-
+        visits=fetch('parking_visits',{'select':'plate,entered_at,exited_at,space,fee','order':'id.desc','limit':'100'})
+        st.dataframe(visits,use_container_width=True,hide_index=True)
+    except Exception as e: st.error(str(e))
+st.caption('데모 전용: 실제 차량번호·개인정보를 입력하지 마세요. 실제 결제는 수행하지 않습니다.')
