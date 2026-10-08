@@ -1,7 +1,5 @@
-
 streamlit>=1.35,<2
-streamlit-webrtc
-av
-opencv-python-headless
-numpy
-easyocr
+numpy>=1.24,<3
+Pillow>=10,<12
+opencv-python-headless>=4.8
+easyocr>=1.7.1
