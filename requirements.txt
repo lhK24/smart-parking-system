@@ -1,7 +1,7 @@
 
 streamlit>=1.35,<2
 streamlit-webrtc
-opencv-python-headless
-easyocr
 av
+opencv-python-headless
 numpy
+easyocr
