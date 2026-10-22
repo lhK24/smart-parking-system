@@ -23,7 +23,7 @@ st.set_page_config(
 )
 
 st.title("🚗 스마트 주차장 관리 시스템")
-st.caption("카메라 번호판 인식 · 입출차 관리 · 주차 공간 현황")
+st.caption("카메라 번호판 인식 · 자동 입출차 · 주차 현황")
 
 
 # ==========================================
@@ -33,8 +33,9 @@ st.caption("카메라 번호판 인식 · 입출차 관리 · 주차 공간 현�
 try:
     URL = st.secrets["SUPABASE_URL"].strip().rstrip("/")
     KEY = st.secrets["SUPABASE_ANON_KEY"].strip()
+
 except Exception:
-    st.error("Streamlit Secrets에서 Supabase 설정을 확인하세요.")
+    st.error("Supabase Secrets 설정을 확인하세요.")
     st.stop()
 
 HEADERS = {
@@ -45,59 +46,71 @@ HEADERS = {
 
 
 def db_get(table, params):
-    response = requests.get(
+    r = requests.get(
         f"{URL}/rest/v1/{table}",
         headers=HEADERS,
         params=params,
         timeout=15
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
 def db_insert(table, data):
-    response = requests.post(
+    r = requests.post(
         f"{URL}/rest/v1/{table}",
-        headers={**HEADERS, "Prefer": "return=representation"},
+        headers={
+            **HEADERS,
+            "Prefer": "return=representation"
+        },
         json=data,
         timeout=15
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
 def db_update(table, params, data):
-    response = requests.patch(
+    r = requests.patch(
         f"{URL}/rest/v1/{table}",
-        headers={**HEADERS, "Prefer": "return=representation"},
+        headers={
+            **HEADERS,
+            "Prefer": "return=representation"
+        },
         params=params,
         json=data,
         timeout=15
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
 # ==========================================
-# 3. 한글 번호판 OCR
+# 3. 번호판 인식
 # ==========================================
 
 @st.cache_resource(show_spinner=False)
 def load_ocr():
-    return easyocr.Reader(["ko", "en"], gpu=False)
+    return easyocr.Reader(
+        ["ko", "en"],
+        gpu=False
+    )
 
 
 def normalize_plate(text):
     return re.sub(
         r"[^0-9가-힣]",
         "",
-        text
+        str(text)
     )
 
 
-def valid_plate(text):
+def valid_plate(plate):
     return bool(
-        re.fullmatch(r"\d{2,3}[가-힣]\d{4}", text)
+        re.fullmatch(
+            r"\d{2,3}[가-힣]\d{4}",
+            plate
+        )
     )
 
 
@@ -105,17 +118,18 @@ def recognize_plate(photo_bytes):
 
     image = Image.open(
         BytesIO(photo_bytes)
-    ).convert("RGB")
+    )
 
     image = ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
 
-    # 큰 사진을 줄여 서버 부하 완화
     if image.width > 1200:
-        new_height = round(
+        height = round(
             image.height * 1200 / image.width
         )
+
         image = image.resize(
-            (1200, new_height)
+            (1200, height)
         )
 
     reader = load_ocr()
@@ -129,23 +143,22 @@ def recognize_plate(photo_bytes):
         canvas_size=1280
     )
 
-    # 개별 인식 문자열부터 검사
-    candidates = [
-        normalize_plate(str(item))
-        for item in results
-    ]
+    # 각각의 OCR 결과에서 번호판 검색
+    for item in results:
 
-    for candidate in candidates:
+        cleaned = normalize_plate(item)
+
         match = re.search(
             r"\d{2,3}[가-힣]\d{4}",
-            candidate
+            cleaned
         )
+
         if match:
             return match.group(), results
 
-    # 번호판이 여러 조각으로 읽힌 경우
+    # 여러 조각으로 읽힌 번호판 결합
     combined = normalize_plate(
-        "".join(str(item) for item in results)
+        "".join(str(x) for x in results)
     )
 
     match = re.search(
@@ -160,11 +173,12 @@ def recognize_plate(photo_bytes):
 
 
 # ==========================================
-# 4. 입차 / 출차 처리
+# 4. 입차 차량 조회
 # ==========================================
 
 def get_active_vehicle(plate):
-    vehicles = db_get(
+
+    result = db_get(
         "parking_visits",
         {
             "select": "id,plate,entered_at,space",
@@ -174,8 +188,12 @@ def get_active_vehicle(plate):
         }
     )
 
-    return vehicles[0] if vehicles else None
+    return result[0] if result else None
 
+
+# ==========================================
+# 5. 자동 입차
+# ==========================================
 
 def process_entry(plate):
 
@@ -184,9 +202,11 @@ def process_entry(plate):
     if existing:
         return False, "이미 입차 중인 차량입니다."
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
 
-    result = db_insert(
+    inserted = db_insert(
         "parking_visits",
         {
             "plate": plate,
@@ -195,40 +215,49 @@ def process_entry(plate):
         }
     )
 
-    if not result:
-        return False, "입차 기록이 저장되지 않았습니다."
+    if not inserted:
+        return False, "입차 저장에 실패했습니다."
 
-    return True, f"{plate} 차량 입차 완료"
+    return True, f"🚗 {plate} 자동 입차 완료"
 
+
+# ==========================================
+# 6. 자동 출차
+# ==========================================
 
 def process_exit(plate):
 
     vehicle = get_active_vehicle(plate)
 
     if not vehicle:
-        return False, "현재 입차 중인 차량이 없습니다."
+        return False, "입차 기록이 없는 차량입니다."
 
     now = datetime.now(timezone.utc)
 
-    entered_at = datetime.fromisoformat(
-        vehicle["entered_at"].replace("Z", "+00:00")
+    entered = datetime.fromisoformat(
+        vehicle["entered_at"].replace(
+            "Z", "+00:00"
+        )
     )
 
-    if entered_at.tzinfo is None:
-        entered_at = entered_at.replace(tzinfo=timezone.utc)
+    if entered.tzinfo is None:
+        entered = entered.replace(
+            tzinfo=timezone.utc
+        )
 
-    elapsed_seconds = max(
+    seconds = max(
         0,
-        (now - entered_at).total_seconds()
+        (now - entered).total_seconds()
     )
 
-    # 1시간당 2,000원, 올림 계산
+    # 1시간당 2000원
+    # 1시간 미만도 1시간으로 계산
     fee = max(
         2000,
-        ceil(elapsed_seconds / 3600) * 2000
+        ceil(seconds / 3600) * 2000
     )
 
-    result = db_update(
+    updated = db_update(
         "parking_visits",
         {
             "id": f"eq.{vehicle['id']}",
@@ -240,10 +269,10 @@ def process_exit(plate):
         }
     )
 
-    if not result:
-        return False, "출차 기록 갱신에 실패했습니다."
+    if not updated:
+        return False, "출차 기록 저장에 실패했습니다."
 
-    # 배정된 주차면 해제
+    # 배정된 주차 공간 비우기
     space = vehicle.get("space")
 
     if space:
@@ -261,27 +290,31 @@ def process_exit(plate):
         if not cleared:
             return (
                 False,
-                "출차 기록은 저장됐지만 주차면 해제를 확인하지 못했습니다."
+                "출차 기록은 저장됐지만 주차 공간 "
+                "해제에 실패했습니다. 관리자 확인이 필요합니다."
             )
 
-    return True, f"{plate} 출차 완료 · 요금 {fee:,}원"
+    return True, (
+        f"🚙 {plate} 자동 출차 완료 · "
+        f"주차 요금 {fee:,}원"
+    )
 
 
 # ==========================================
-# 5. 카메라 및 번호판 인식
+# 7. 카메라 자동 인식 및 자동 입출차
 # ==========================================
 
-st.subheader("📷 차량 번호판 자동 인식")
+st.subheader("📷 실시간 주차장 카메라")
 
 camera_mode = st.radio(
-    "카메라 위치 선택",
+    "카메라 위치",
     ["입구", "출구"],
     horizontal=True
 )
 
 st.info(
-    "카메라로 번호판을 촬영한 뒤 "
-    "'번호판 인식하기'를 눌러주세요."
+    "번호판을 촬영하고 '번호판 인식하기'를 누르면 "
+    "입차 또는 출차가 자동으로 확정됩니다."
 )
 
 photo = st.camera_input(
@@ -289,28 +322,32 @@ photo = st.camera_input(
     key="parking_camera"
 )
 
-if "recognized_plate" not in st.session_state:
-    st.session_state.recognized_plate = ""
+# 중복 처리 방지용 상태
+if "processed_images" not in st.session_state:
+    st.session_state.processed_images = set()
 
-if "photo_hash" not in st.session_state:
-    st.session_state.photo_hash = ""
+if "last_photo_id" not in st.session_state:
+    st.session_state.last_photo_id = ""
 
-if "processed_hashes" not in st.session_state:
-    st.session_state.processed_hashes = []
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
 
 
 if photo is not None:
 
     photo_bytes = photo.getvalue()
 
-    current_hash = hashlib.sha256(
+    photo_hash = hashlib.sha256(
         photo_bytes
     ).hexdigest()
 
-    # 새 사진이면 이전 OCR 결과 삭제
-    if st.session_state.photo_hash != current_hash:
-        st.session_state.photo_hash = current_hash
-        st.session_state.recognized_plate = ""
+    process_id = photo_hash + ":" + camera_mode
+
+    # 다른 사진이나 카메라 모드로 변경 시
+    # 이전 결과 초기화
+    if st.session_state.last_photo_id != process_id:
+        st.session_state.last_photo_id = process_id
+        st.session_state.last_result = None
 
     st.image(
         photo_bytes,
@@ -320,100 +357,127 @@ if photo is not None:
 
     if st.button(
         "🔍 번호판 인식하기",
-        type="primary"
+        type="primary",
+        use_container_width=True
     ):
 
-        try:
-            with st.spinner(
-                "한국 번호판 인식 중..."
-            ):
-                plate, raw_results = recognize_plate(
-                    photo_bytes
-                )
+        if process_id in st.session_state.processed_images:
 
-            if plate:
-                st.session_state.recognized_plate = plate
-                st.success(f"번호판 인식: {plate}")
-            else:
-                st.session_state.recognized_plate = ""
-                st.warning(
-                    "번호판을 정확하게 읽지 못했습니다. "
-                    "아래 입력칸에서 직접 수정할 수 있습니다."
-                )
-
-            with st.expander("OCR 분석 결과"):
-                st.write(raw_results)
-
-        except Exception as e:
-            st.error(f"번호판 인식 오류: {e}")
-
-    st.divider()
-
-    st.write("**인식된 번호판 확인**")
-
-    plate_text = st.text_input(
-        "차량번호",
-        value=st.session_state.recognized_plate,
-        placeholder="예: 123가4567",
-        key=f"plate_input_{current_hash}"
-    )
-
-    final_plate = normalize_plate(plate_text)
-
-    if final_plate and not valid_plate(final_plate):
-        st.warning(
-            "일반 번호판 형식으로 입력해 주세요. "
-            "예: 12가3456 또는 123가4567"
-        )
-
-    action = "입차" if camera_mode == "입구" else "출차"
-
-    if st.button(
-        f"✅ {action} 확정",
-        disabled=not valid_plate(final_plate)
-    ):
-
-        process_key = current_hash + ":" + action
-
-        if process_key in st.session_state.processed_hashes:
             st.warning(
-                "이 사진은 이미 처리했습니다. "
-                "새 사진을 촬영해 주세요."
+                "이미 처리된 사진입니다. "
+                "새 번호판 사진을 촬영해 주세요."
             )
+
         else:
+
             try:
-                if camera_mode == "입구":
-                    success, message = process_entry(
-                        final_plate
-                    )
-                else:
-                    success, message = process_exit(
-                        final_plate
+
+                with st.spinner(
+                    "번호판 인식 중..."
+                ):
+
+                    plate, raw_results = recognize_plate(
+                        photo_bytes
                     )
 
-                if success:
-                    st.session_state.processed_hashes.append(
-                        process_key
+                if valid_plate(plate):
+
+                    st.success(
+                        f"✅ 번호판 인식 성공: {plate}"
                     )
-                    st.success(message)
+
+                    # ==================================
+                    # 자동 입차 또는 자동 출차
+                    # ==================================
+
+                    if camera_mode == "입구":
+
+                        success, message = process_entry(
+                            plate
+                        )
+
+                    else:
+
+                        success, message = process_exit(
+                            plate
+                        )
+
+                    st.session_state.last_result = {
+                        "plate": plate,
+                        "success": success,
+                        "message": message,
+                        "raw": raw_results
+                    }
+
+                    if success:
+
+                        st.session_state.processed_images.add(
+                            process_id
+                        )
+
+                        st.success(message)
+
+                    else:
+
+                        st.warning(message)
+
                 else:
-                    st.warning(message)
+
+                    st.session_state.last_result = {
+                        "plate": "",
+                        "success": False,
+                        "message": (
+                            "번호판을 정확하게 인식하지 못했습니다. "
+                            "다시 촬영해 주세요."
+                        ),
+                        "raw": raw_results
+                    }
+
+                    st.warning(
+                        st.session_state.last_result["message"]
+                    )
 
             except Exception as e:
-                st.error(f"입출차 처리 오류: {e}")
+
+                st.error(
+                    f"자동 인식 또는 입출차 처리 오류: {e}"
+                )
+
+    if st.session_state.last_result:
+
+        result = st.session_state.last_result
+
+        st.divider()
+
+        st.write("### 📋 최근 인식 결과")
+
+        if result["plate"]:
+            st.write(
+                f"차량번호: **{result['plate']}**"
+            )
+
+        if result["success"]:
+            st.success(result["message"])
+        else:
+            st.warning(result["message"])
+
+        with st.expander("OCR 분석 결과"):
+            st.write(result["raw"])
 
 
 # ==========================================
-# 6. 주차장 데이터
+# 8. 주차장 현황
 # ==========================================
 
 st.divider()
-st.subheader("📊 실시간 주차 현황")
 
-if st.button("🔄 새로고침"):
+st.subheader("📊 주차장 실시간 현황")
+
+if st.button("🔄 현황 새로고침"):
     st.rerun()
 
 try:
+
     spaces = db_get(
         "parking_spaces",
         {
@@ -432,24 +496,44 @@ try:
     )
 
 except Exception as e:
-    st.error(f"주차장 데이터 조회 오류: {e}")
+
+    st.error(
+        f"데이터베이스 조회 오류: {e}"
+    )
+
     st.stop()
+
 
 occupied = sum(
     bool(s["plate"])
     for s in spaces
 )
 
-col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-col1.metric("전체 주차면", len(spaces))
-col2.metric("빈자리", len(spaces) - occupied)
-col3.metric("사용 중", occupied)
-col4.metric("입차 차량", len(active))
+c1.metric(
+    "전체 주차면",
+    len(spaces)
+)
+
+c2.metric(
+    "빈자리",
+    len(spaces) - occupied
+)
+
+c3.metric(
+    "사용 중",
+    occupied
+)
+
+c4.metric(
+    "입차 차량",
+    len(active)
+)
 
 
 # ==========================================
-# 7. 주차면 표시
+# 9. 주차 공간 표시
 # ==========================================
 
 st.subheader("🅿️ 주차 공간 현황")
@@ -458,21 +542,29 @@ for i in range(0, len(spaces), 3):
 
     cols = st.columns(3)
 
-    for col, space in zip(cols, spaces[i:i + 3]):
+    for col, space in zip(
+        cols,
+        spaces[i:i + 3]
+    ):
 
         with col:
+
             if space["plate"]:
+
                 st.error(
-                    f"🚘 {space['name']} · {space['plate']}"
+                    f"🚘 {space['name']} "
+                    f"· {space['plate']}"
                 )
+
             else:
+
                 st.success(
                     f"🅿️ {space['name']} · 빈자리"
                 )
 
 
 # ==========================================
-# 8. 차량 조회 / 공간 배정 / 기록
+# 10. 관리 메뉴
 # ==========================================
 
 tab1, tab2, tab3 = st.tabs([
@@ -482,34 +574,53 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 
+# ==========================================
+# 11. 내 차 찾기
+# ==========================================
+
 with tab1:
 
-    query = st.text_input(
-        "찾을 차량번호",
-        key="search_plate"
+    search = st.text_input(
+        "차량번호 입력",
+        key="search_input"
     )
 
-    if st.button("조회"):
+    if st.button("차량 조회"):
 
-        target = normalize_plate(query)
+        search_plate = normalize_plate(search)
 
         matches = [
             v for v in active
-            if v["plate"] == target
+            if v["plate"] == search_plate
         ]
 
         if matches:
-            v = matches[0]
+
+            vehicle = matches[0]
 
             st.success(
-                f"주차 위치: {v['space'] or '미배정'}"
+                f"차량번호: {search_plate}"
             )
-            st.write(
-                f"입차 시간: {v['entered_at']}"
-            )
-        else:
-            st.warning("해당 차량을 찾지 못했습니다.")
 
+            st.info(
+                "주차 위치: "
+                f"{vehicle['space'] or '미배정'}"
+            )
+
+            st.write(
+                f"입차 시간: {vehicle['entered_at']}"
+            )
+
+        else:
+
+            st.warning(
+                "입차 중인 차량이 없습니다."
+            )
+
+
+# ==========================================
+# 12. 주차면 배정
+# ==========================================
 
 with tab2:
 
@@ -528,27 +639,28 @@ with tab2:
         with st.form("assign_form"):
 
             vehicle = st.selectbox(
-                "차량",
+                "차량 선택",
                 waiting,
                 format_func=lambda v: v["plate"]
             )
 
-            chosen_space = st.selectbox(
-                "주차면",
+            selected_space = st.selectbox(
+                "주차면 선택",
                 free
             )
 
-            submitted = st.form_submit_button(
+            submit = st.form_submit_button(
                 "배정하기"
             )
 
-        if submitted:
+        if submit:
 
             try:
+
                 updated_space = db_update(
                     "parking_spaces",
                     {
-                        "name": f"eq.{chosen_space}",
+                        "name": f"eq.{selected_space}",
                         "plate": "is.null"
                     },
                     {
@@ -557,9 +669,13 @@ with tab2:
                 )
 
                 if not updated_space:
-                    st.error("이미 사용 중인 주차면입니다.")
+
+                    st.warning(
+                        "이미 사용 중인 주차면입니다."
+                    )
 
                 else:
+
                     updated_visit = db_update(
                         "parking_visits",
                         {
@@ -567,31 +683,47 @@ with tab2:
                             "space": "is.null"
                         },
                         {
-                            "space": chosen_space
+                            "space": selected_space
                         }
                     )
 
                     if updated_visit:
-                        st.success("주차면 배정 완료")
+
+                        st.success(
+                            f"{vehicle['plate']} 차량 "
+                            f"{selected_space} 배정 완료"
+                        )
+
                         st.rerun()
+
                     else:
+
                         st.error(
-                            "입차 기록 배정에 실패했습니다. "
+                            "입차 기록 업데이트에 실패했습니다. "
                             "주차면 데이터 확인이 필요합니다."
                         )
 
             except Exception as e:
-                st.error(f"배정 오류: {e}")
+
+                st.error(
+                    f"주차면 배정 오류: {e}"
+                )
 
     else:
+
         st.info(
             "대기 차량 또는 빈 주차면이 없습니다."
         )
 
 
+# ==========================================
+# 13. 입출차 기록
+# ==========================================
+
 with tab3:
 
     try:
+
         visits = db_get(
             "parking_visits",
             {
@@ -611,12 +743,24 @@ with tab3:
         )
 
     except Exception as e:
-        st.error(str(e))
 
+        st.error(
+            f"기록 조회 실패: {e}"
+        )
+
+
+# ==========================================
+# 14. 하단 안내
+# ==========================================
 
 st.divider()
 
 st.caption(
-    "캡스톤 시연용 시스템입니다. "
-    "실제 차량번호 대신 시험용 번호를 사용하세요."
+    "스마트 주차장 캡스톤디자인 · "
+    "번호판 인식 후 자동 입출차 시스템"
+)
+
+st.caption(
+    "시연용 시스템입니다. "
+    "실제 차량번호 대신 테스트용 번호판을 사용하세요."
 )
