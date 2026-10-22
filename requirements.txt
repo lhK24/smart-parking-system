@@ -1,2 +1,5 @@
 streamlit
 requests
+easyocr==1.7.2
+numpy
+Pillow
