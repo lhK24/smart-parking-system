@@ -1,5 +1,5 @@
 
-"""Smart Parking dashboard: sensor bays A-1..A-3 and separate visit records."""
+"""Smart Parking dashboard: three sensor bays and separate vehicle records."""
 
 import re
 from datetime import datetime, timezone
@@ -20,7 +20,6 @@ st.set_page_config(
 )
 
 st.title("🚗 스마트 주차장 관리 시스템")
-
 st.caption(
     "라즈베리파이 자동 번호판 인식 · "
     "주차센서 3칸 · 실시간 입출차 기록"
@@ -28,27 +27,13 @@ st.caption(
 
 
 # ====================================
-# PARKING SPACE SETTINGS
+# SETTINGS
 # ====================================
 
 SENSOR_SPACES = ("A-1", "A-2", "A-3")
 
-# Marker written by Raspberry Pi sensor sync
-SENSOR_MARKER = "SENSOR_OCCUPIED"
-
-
-# ====================================
-# SUPABASE CONNECTION
-# ====================================
-
-try:
-    URL = st.secrets["SUPABASE_URL"].strip().rstrip("/")
-    KEY = st.secrets["SUPABASE_ANON_KEY"].strip()
-
-except Exception:
-    st.error("Supabase Secrets 설정을 확인하세요.")
-    st.stop()
-
+URL = st.secrets["SUPABASE_URL"].strip().rstrip("/")
+KEY = st.secrets["SUPABASE_ANON_KEY"].strip()
 
 HEADERS = {
     "apikey": KEY,
@@ -56,6 +41,10 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+
+# ====================================
+# SUPABASE FUNCTIONS
+# ====================================
 
 def db_get(table, params):
 
@@ -67,7 +56,6 @@ def db_get(table, params):
     )
 
     response.raise_for_status()
-
     return response.json()
 
 
@@ -85,7 +73,6 @@ def db_update(table, params, data):
     )
 
     response.raise_for_status()
-
     return response.json()
 
 
@@ -111,7 +98,6 @@ def fmt_time(iso):
         dt = datetime.fromisoformat(
             str(iso).replace("Z", "+00:00")
         )
-
         return dt.astimezone().strftime(
             "%Y-%m-%d %H:%M"
         )
@@ -121,7 +107,7 @@ def fmt_time(iso):
 
 
 # ====================================
-# VEHICLE LOOKUP
+# VEHICLE EXIT
 # ====================================
 
 def get_active_vehicle(plate):
@@ -139,10 +125,6 @@ def get_active_vehicle(plate):
     return result[0] if result else None
 
 
-# ====================================
-# VEHICLE EXIT / PARKING FEE
-# ====================================
-
 def process_exit(plate):
 
     vehicle = get_active_vehicle(plate)
@@ -157,16 +139,13 @@ def process_exit(plate):
     )
 
     if entered.tzinfo is None:
-        entered = entered.replace(
-            tzinfo=timezone.utc
-        )
+        entered = entered.replace(tzinfo=timezone.utc)
 
     seconds = max(
         0,
         (now - entered).total_seconds()
     )
 
-    # 2,000 KRW per hour
     fee = max(
         2000,
         ceil(seconds / 3600) * 2000
@@ -185,10 +164,8 @@ def process_exit(plate):
     )
 
     if not updated:
-        return False, "출차 기록 저장에 실패했습니다."
+        return False, "출차 저장에 실패했습니다."
 
-    # Clear only the exact assigned vehicle plate.
-    # Never modify SENSOR_OCCUPIED.
     space = vehicle.get("space")
 
     if space:
@@ -203,33 +180,19 @@ def process_exit(plate):
             }
         )
 
-    return True, (
-        f"{plate} 출차 완료 · 요금 {fee:,}원"
-    )
+    return True, f"{plate} 출차 완료 · 요금 {fee:,}원"
 
 
 # ====================================
-# LIVE PARKING STATUS
+# MAIN DASHBOARD
 # ====================================
 
 st.subheader("📊 주차장 실시간 현황")
 
-if st.button("🔄 현황 새로고침"):
+if st.button("🔄 입차 기록 새로고침"):
     st.rerun()
 
-
 try:
-    # Only the three actually installed sensors
-    spaces = db_get(
-        "parking_spaces",
-        {
-            "select": "name,plate",
-            "name": "in.(A-1,A-2,A-3)",
-            "order": "name.asc"
-        }
-    )
-
-    # Vehicle entry records are separate
     active = db_get(
         "parking_visits",
         {
@@ -240,156 +203,109 @@ try:
     )
 
 except Exception as error:
-
-    st.error(
-        f"데이터베이스 조회 오류: {error}"
-    )
-
+    st.error(f"입차 기록 조회 오류: {error}")
     st.stop()
 
 
-by_name = {
-    space["name"]: space
-    for space in spaces
-}
-
-
 # ====================================
-# SENSOR STATE
+# SENSOR STATUS: AUTO REFRESH
 # ====================================
 
-def space_state(space):
+@st.fragment(run_every="5s")
+def show_sensor_dashboard():
 
-    if space is None:
-        return "미확인"
+    try:
+        spaces = db_get(
+            "parking_spaces",
+            {
+                "select": "name,plate,sensor_status",
+                "name": "in.(A-1,A-2,A-3)",
+                "order": "name.asc"
+            }
+        )
 
-    plate = space.get("plate")
+    except Exception as error:
+        st.error(f"주차센서 조회 오류: {error}")
+        return
 
-    # Sensor detected a vehicle
-    if plate == SENSOR_MARKER:
-        return "PARKING"
+    by_name = {
+        space["name"]: space
+        for space in spaces
+    }
 
-    # Current legacy DB behavior
-    if plate is None or plate == "":
-        return "EMPTY"
+    states = {}
 
-    # Real plate is not a sensor measurement
-    return "미확인"
+    for name in SENSOR_SPACES:
 
+        sensor_status = (
+            by_name.get(name, {})
+            .get("sensor_status")
+        )
 
-states = {
-    name: space_state(by_name.get(name))
-    for name in SENSOR_SPACES
-}
-
-occupied = sum(
-    state == "PARKING"
-    for state in states.values()
-)
-
-empty = sum(
-    state == "EMPTY"
-    for state in states.values()
-)
-
-unknown = sum(
-    state == "미확인"
-    for state in states.values()
-)
-
-
-# ====================================
-# PARKING COUNTS
-# ====================================
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric(
-    "센서 설치 주차면",
-    len(SENSOR_SPACES)
-)
-
-c2.metric(
-    "빈자리 (추정)",
-    empty
-)
-
-c3.metric(
-    "감지된 사용 중",
-    occupied
-)
-
-c4.metric(
-    "상태 미확인",
-    unknown
-)
-
-st.caption(
-    f"현재 입차 기록: {len(active)}대 · "
-    "입차 차량 수와 실제 주차 칸 수는 별개입니다."
-)
-
-
-# ====================================
-# PARKING SPACE DISPLAY
-# ====================================
-
-st.subheader("🅿️ 주차공간 센서 현황")
-
-st.caption(
-    "실제 초음파센서가 설치된 "
-    "A-1, A-2, A-3만 표시합니다."
-)
-
-columns = st.columns(3)
-
-for col, name in zip(columns, SENSOR_SPACES):
-
-    state = states[name]
-
-    with col:
-
-        if state == "PARKING":
-
-            st.error(
-                f"🚘 {name} · PARKING"
-            )
-
-        elif state == "EMPTY":
-
-            st.success(
-                f"🅿️ {name} · EMPTY"
-            )
-
+        if sensor_status in ("PARKING", "EMPTY"):
+            states[name] = sensor_status
         else:
+            states[name] = "미확인"
 
-            st.warning(
-                f"❔ {name} · 센서 상태 미확인"
-            )
+    occupied = sum(
+        value == "PARKING"
+        for value in states.values()
+    )
 
-            current_plate = (
-                by_name.get(name, {}).get("plate")
-            )
+    empty = sum(
+        value == "EMPTY"
+        for value in states.values()
+    )
 
-            if current_plate not in (
-                None,
-                "",
-                SENSOR_MARKER
-            ):
+    unknown = len(SENSOR_SPACES) - occupied - empty
 
-                st.caption(
-                    "기존 차량번호 배정은 "
-                    "센서 판정이 아닙니다."
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("센서 설치 주차면", 3)
+    c2.metric("빈자리", empty)
+    c3.metric("주차 중", occupied)
+    c4.metric("상태 미확인", unknown)
+
+    st.subheader("🅿️ 주차공간 센서 현황")
+
+    st.caption(
+        "A-1, A-2, A-3 · "
+        "센서 상태 5초마다 자동 갱신"
+    )
+
+    cols = st.columns(3)
+
+    for col, name in zip(cols, SENSOR_SPACES):
+
+        with col:
+
+            state = states[name]
+
+            if state == "PARKING":
+                st.error(
+                    f"🚘 {name} · PARKING (주차 중)"
+                )
+
+            elif state == "EMPTY":
+                st.success(
+                    f"🅿️ {name} · EMPTY (빈자리)"
+                )
+
+            else:
+                st.warning(
+                    f"❔ {name} · 센서 상태 미확인"
                 )
 
 
-st.info(
-    "현재 데이터베이스에는 센서 전용 상태 "
-    "컬럼이 없습니다. 차량번호가 배정된 칸은 "
-    "'센서 상태 미확인'으로 표시합니다. "
-    "실제 센서값과 차량번호를 완전히 분리하려면 "
-    "Supabase에 sensor_status 컬럼을 추가하고 "
-    "라즈베리파이 동기화 코드를 변경해야 합니다."
+show_sensor_dashboard()
+
+st.caption(
+    "차량 번호판은 별도 입차 기록으로 관리합니다. "
+    "센서 상태만으로 차량번호를 판단하지 않습니다."
+)
+
+st.caption(
+    f"현재 입차 기록: {len(active)}대"
 )
 
 
@@ -397,9 +313,7 @@ st.info(
 # ENTRY VEHICLE RECORDS
 # ====================================
 
-st.subheader(
-    "🚗 입차 차량 현황 (번호판 OCR 기록)"
-)
+st.subheader("🚗 입차 차량 현황 (번호판 OCR 기록)")
 
 if active:
 
@@ -413,9 +327,8 @@ if active:
                 "입차시간": fmt_time(
                     vehicle.get("entered_at")
                 ),
-                "수동 배정 주차면": (
-                    vehicle.get("space")
-                    or "미배정"
+                "배정 주차면": (
+                    vehicle.get("space") or "미배정"
                 )
             }
         )
@@ -427,10 +340,7 @@ if active:
     )
 
 else:
-
-    st.info(
-        "현재 입차 중인 차량 기록이 없습니다."
-    )
+    st.info("현재 입차 중인 차량 기록이 없습니다.")
 
 
 # ====================================
@@ -450,7 +360,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 
 
 # ====================================
-# TAB 1 - FIND MY CAR
+# TAB 1: FIND MY CAR
 # ====================================
 
 with tab1:
@@ -466,9 +376,8 @@ with tab1:
 
         found = next(
             (
-                vehicle
-                for vehicle in active
-                if vehicle["plate"] == plate
+                v for v in active
+                if v["plate"] == plate
             ),
             None
         )
@@ -481,9 +390,7 @@ with tab1:
 
             st.write(
                 "입차시간:",
-                fmt_time(
-                    found.get("entered_at")
-                )
+                fmt_time(found.get("entered_at"))
             )
 
             st.write(
@@ -492,38 +399,49 @@ with tab1:
             )
 
         else:
-
             st.warning(
                 "입차 중인 차량이 없습니다."
             )
 
 
 # ====================================
-# TAB 2 - ASSIGN SPACE
+# TAB 2: ASSIGN PARKING SPACE
 # ====================================
 
 with tab2:
 
     st.caption(
-        "이 기능은 수동 차량 배정입니다. "
-        "초음파센서가 차량번호를 인식하는 "
-        "기능은 아닙니다."
+        "수동 차량 배정 기능입니다. "
+        "센서가 EMPTY이고 차량번호가 "
+        "미배정인 칸만 표시합니다."
     )
 
     waiting = [
-        vehicle
-        for vehicle in active
-        if not vehicle.get("space")
+        v for v in active
+        if not v.get("space")
     ]
 
-    free = [
-        name
-        for name in SENSOR_SPACES
-        if (
-            by_name.get(name)
-            and not by_name[name].get("plate")
+    try:
+        assignable_spaces = db_get(
+            "parking_spaces",
+            {
+                "select": "name,plate,sensor_status",
+                "name": "in.(A-1,A-2,A-3)"
+            }
         )
-    ]
+
+        free = [
+            space["name"]
+            for space in assignable_spaces
+            if (
+                not space.get("plate")
+                and space.get("sensor_status") == "EMPTY"
+            )
+        ]
+
+    except Exception as error:
+        st.error(f"배정 가능 주차면 조회 오류: {error}")
+        free = []
 
     if waiting and free:
 
@@ -547,12 +465,12 @@ with tab2:
         if submit:
 
             try:
-
                 updated_space = db_update(
                     "parking_spaces",
                     {
                         "name": f"eq.{selected_space}",
-                        "plate": "is.null"
+                        "plate": "is.null",
+                        "sensor_status": "eq.EMPTY"
                     },
                     {
                         "plate": vehicle["plate"]
@@ -562,7 +480,8 @@ with tab2:
                 if not updated_space:
 
                     st.warning(
-                        "이미 사용 중인 주차면입니다."
+                        "이미 사용 중이거나 "
+                        "빈자리가 아닌 주차면입니다."
                     )
 
                 else:
@@ -589,14 +508,11 @@ with tab2:
 
                     else:
 
-                        # Roll back space assignment
                         db_update(
                             "parking_spaces",
                             {
                                 "name": f"eq.{selected_space}",
-                                "plate": (
-                                    f"eq.{vehicle['plate']}"
-                                )
+                                "plate": f"eq.{vehicle['plate']}"
                             },
                             {
                                 "plate": None
@@ -604,8 +520,7 @@ with tab2:
                         )
 
                         st.error(
-                            "입차 기록 업데이트에 실패하여 "
-                            "배정을 취소했습니다."
+                            "배정 기록 업데이트 실패"
                         )
 
             except Exception as error:
@@ -615,21 +530,19 @@ with tab2:
                 )
 
     else:
-
         st.info(
             "미배정 차량이나 배정 가능한 "
-            "주차면이 없습니다."
+            "빈 주차면이 없습니다."
         )
 
 
 # ====================================
-# TAB 3 - ENTRY / EXIT HISTORY
+# TAB 3: ENTRY / EXIT HISTORY
 # ====================================
 
 with tab3:
 
     try:
-
         visits = db_get(
             "parking_visits",
             {
@@ -656,14 +569,14 @@ with tab3:
 
 
 # ====================================
-# TAB 4 - MANUAL EXIT
+# TAB 4: MANUAL EXIT
 # ====================================
 
 with tab4:
 
     st.warning(
-        "수동 출차는 실제 차단기를 움직이지 "
-        "않으며 DB 기록만 변경합니다."
+        "수동 출차는 DB 기록만 변경하며 "
+        "실제 차단기는 움직이지 않습니다."
     )
 
     if active:
@@ -676,10 +589,8 @@ with tab4:
                 format_func=lambda v: v["plate"]
             )
 
-            submit_exit = (
-                st.form_submit_button(
-                    "선택 차량 출차 확정"
-                )
+            submit_exit = st.form_submit_button(
+                "선택 차량 출차 확정"
             )
 
         if submit_exit:
@@ -691,12 +602,10 @@ with tab4:
                 )
 
                 if ok:
-
                     st.success(message)
                     st.rerun()
 
                 else:
-
                     st.warning(message)
 
             except Exception as error:
